@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, List
 from torch.utils.checkpoint import checkpoint
-from LION.models.LIONmodel import LIONmodel, ModelParams, ModelInputType
+from LION.models.LIONmodel import LIONmodel, LIONModelParameter, ModelInputType
 from LION.utils.parameter import LIONParameter
 import LION.CTtools.ct_geometry as ct
 
