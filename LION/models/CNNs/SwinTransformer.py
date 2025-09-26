@@ -345,7 +345,9 @@ class SwinTransformer(LIONmodel):
     reconstruction tasks, following the LION framework conventions.
     """
 
-    def __init__(self, geometry: ct.Geometry, model_parameters: ModelParams = None):
+    def __init__(
+        self, geometry: ct.Geometry, model_parameters: LIONModelParameter = None
+    ):
         if geometry is None:
             raise ValueError("Geometry Parameters Required")
 
@@ -430,7 +432,7 @@ class SwinTransformer(LIONmodel):
     @staticmethod
     def default_parameters():
         """Default parameters for Swin Transformer CT reconstruction."""
-        params = ModelParams(ModelInputType.IMAGE)
+        params = LIONModelParameter()
         params.model_input_type = ModelInputType.IMAGE
         params.img_size = 256
         params.patch_size = 4
@@ -500,6 +502,7 @@ class SwinTransformer(LIONmodel):
 
         # Forward through layers
         for layer in self.layers:
+            print(x.shape)  ## print shape after every basic layer..
             x, Wh, Ww, x_down, Wh_down, Ww_down = layer(x, Wh, Ww)
             if x_down is not None:
                 x = x_down
