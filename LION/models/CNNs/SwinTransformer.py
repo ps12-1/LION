@@ -351,7 +351,7 @@ class SwinTransformer(LIONmodel):
         if geometry is None:
             raise ValueError("Geometry Parameters Required")
 
-        super().__init__(model_parameters, geometry)
+        super().__init__(model_parameters, geometry)  ##model_params = default
 
         # Image size and patch size
         self.img_size = model_parameters.img_size
@@ -411,8 +411,37 @@ class SwinTransformer(LIONmodel):
             )
             self.layers.append(layer)
 
-        # Output projection
-        # self.lay
+        # Decoder: Upsample back to original resolution
+        # Calculate final dimension after all layers
+        final_dim = int(self.embed_dim * 2 ** (len(self.depths) - 1))
+
+        # Build upsampling layers to restore original spatial resolution
+        # Number of upsampling steps = number of PatchMerging operations
+        num_upsample = len(self.depths) - 1
+        self.upsample_layers = nn.ModuleList()
+
+        for i in range(num_upsample):
+            # Upsample by 2x and reduce channels by 2x
+            current_dim = int(final_dim // (2**i))
+            next_dim = current_dim // 2
+
+            upsample_layer = nn.Sequential(
+                nn.ConvTranspose2d(current_dim, next_dim, kernel_size=2, stride=2),
+                nn.GroupNorm(num_groups=1, num_channels=next_dim),
+                nn.GELU(),
+            )
+            self.upsample_layers.append(upsample_layer)
+
+        # Final upsampling to match patch embedding
+        # This upsamples from patch resolution to pixel resolution
+        self.final_upsample = nn.ConvTranspose2d(
+            self.embed_dim,
+            self.embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+
+        # Output projection to get final image
         self.output_proj = nn.Conv2d(
             self.embed_dim, model_parameters.out_chans, kernel_size=1
         )
@@ -502,16 +531,24 @@ class SwinTransformer(LIONmodel):
 
         # Forward through layers
         for layer in self.layers:
-            print(x.shape)  ## print shape after every basic layer..
             x, Wh, Ww, x_down, Wh_down, Ww_down = layer(x, Wh, Ww)
-            if x_down is not None:
-                x = x_down
-                Wh, Ww = Wh_down, Ww_down
+            # Use downsampled output if available
+            x = x_down
+            Wh, Ww = Wh_down, Ww_down
 
         # Reshape back to spatial dimensions
         x = x.view(B, Wh, Ww, -1).permute(0, 3, 1, 2)  # B, C, H, W
 
-        # Output projection
+        # Decoder: Progressively upsample back to original resolution
+        # Upsample from 16x16 -> 32x32 -> 64x64 -> 128x128 (patch resolution)
+        for upsample_layer in self.upsample_layers:
+            x = upsample_layer(x)
+
+        # Final upsampling from patch resolution to pixel resolution
+        # 128x128 patches -> 512x512 pixels (with patch_size=4)
+        x = self.final_upsample(x)
+
+        # Output projection to get final image
         x = self.output_proj(x)
 
         return x

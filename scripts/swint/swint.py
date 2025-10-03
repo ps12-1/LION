@@ -48,7 +48,7 @@ lidc_dataset_val = experiment.get_validation_dataset()
 lidc_dataset_test = experiment.get_testing_dataset()
 
 # smaller dataset for example. Remove this for full dataset
-indices = torch.arange(1)  # Use 10 samples for demonstration ##use 1 sample
+indices = torch.arange(1)  # Use 1 sample for demonstration
 lidc_dataset = data_utils.Subset(lidc_dataset, indices)
 lidc_dataset_val = data_utils.Subset(lidc_dataset_val, indices)
 
@@ -63,16 +63,27 @@ lidc_test = DataLoader(lidc_dataset_test, batch_size, shuffle=False)
 default_parameters = SwinTransformer.default_parameters()
 
 # Adjust parameters for CT reconstruction
-default_parameters.img_size = 512  # Standard CT image size  ##changed from 256 to 512
+# Note: img_size/patch_size must be divisible by window_size
+# 512/4 = 128 patches, 128/8 = 16 windows per dimension ✓
+default_parameters.img_size = 512  # Standard CT image size (changed from default 256)
 default_parameters.patch_size = 4  # Smaller patches for better detail
-default_parameters.embed_dim = 96  # Base embedding dimension
-default_parameters.depths = [2, 2, 6, 2]  # Number of blocks in each stage
-default_parameters.num_heads = [3, 6, 12, 24]  # Number of attention heads
-default_parameters.window_size = 7  # Window size for attention
+default_parameters.embed_dim = (
+    96  # Base embedding dimension (final dim will be 96 * 2^3 = 768)
+)
+default_parameters.depths = [
+    2,
+    2,
+    6,
+    2,
+]  # Number of blocks in each stage (total 12 blocks)
+default_parameters.num_heads = [3, 6, 12, 24]  # Number of attention heads per stage
+default_parameters.window_size = (
+    8  # Window size for local attention (8x8 patches, divisible into 128)
+)
 default_parameters.mlp_ratio = 4.0  # MLP expansion ratio
 default_parameters.drop_rate = 0.0  # Dropout rate
 default_parameters.attn_drop_rate = 0.0  # Attention dropout rate
-default_parameters.drop_path_rate = 0.1  # Stochastic depth rate
+default_parameters.drop_path_rate = 0.1  # Stochastic depth rate (regularization)
 
 model = SwinTransformer(experiment.geometry, default_parameters)
 model.to(device)
@@ -147,7 +158,11 @@ solver.save_final_results(final_result_fname, savefolder)
 # Test
 print("Testing model...")
 test_results = solver.test()
-print(f"Test SSIM: {test_results:.4f}")
+if hasattr(test_results, "__iter__") and not isinstance(test_results, str):
+    print(f"Test SSIM (mean): {test_results.mean():.4f}")
+    print(f"Test SSIM (all): {test_results}")
+else:
+    print(f"Test SSIM: {test_results:.4f}")
 
 # Plot training loss
 plt.figure(figsize=(10, 6))
