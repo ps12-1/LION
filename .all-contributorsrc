@@ -103,7 +103,7 @@
       "contributions": [
         "code",
         "design"
-       ]
+      ]
     },
     {
       "login": "cshoebridge",
@@ -114,6 +114,29 @@
         "code",
         "design",
         "ideas"
+      ]
+    },
+    {
+      "login": "AndreaSainz",
+      "name": "Andrea Sainz Bear",
+      "avatar_url": "https://avatars.githubusercontent.com/u/185353475?v=4",
+      "profile": "https://github.com/AndreaSainz",
+      "contributions": [
+        "code",
+        "bug",
+        "research"
+      ]
+    },
+    {
+      "login": "trung-vt",
+      "name": "Thanh Trung Vu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/65380717?v=4",
+      "profile": "https://github.com/trung-vt",
+      "contributions": [
+        "code",
+        "bug",
+        "research",
+        "design"
       ]
     }
   ],
