@@ -409,6 +409,21 @@ def train(
         save_folder=output_dir,
     )
 
+    # We drive epochs manually via `epoch_step`, so make sure internal history
+    # buffers are allocated to the requested epoch count.
+    solver.solver_params.epochs = epochs
+    if (
+        not hasattr(solver, "train_loss")
+        or solver.train_loss is None
+        or len(solver.train_loss) < epochs
+    ):
+        solver.train_loss = np.full((epochs,), np.nan, dtype=np.float32)
+
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            "Training loader is empty. Increase --train-samples or dataset size."
+        )
+
     # Enhanced Model Selection: Track validation metrics
     best_psnr = -np.inf
     best_epoch = 0
