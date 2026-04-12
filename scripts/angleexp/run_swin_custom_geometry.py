@@ -93,105 +93,174 @@ class CustomGeomExperiment:
         return self._base.get_testing_dataset()
 
 
-# ── Swin Transformer from scratch (identical to run_swin_noise2inverse.py) ───
+# ── SwinIR-style CT Denoiser (Liang et al. 2021, adapted for N2I) ────────────
+#
+# Architecture (mirrors SwinIR for image denoising):
+#   1. Shallow feature extraction  – 3×3 Conv
+#   2. Deep feature extraction     – num_rstb × RSTB  +  LayerNorm  +  3×3 Conv
+#      Each RSTB = stl_per_rstb × SwinTransformerLayer (W-MSA/SW-MSA)
+#                + 3×3 Conv  +  residual connection
+#   3. Reconstruction              – (f_shallow + f_deep) → 3×3 Conv
+#      Residual learning: output = input + recon(f_shallow + f_deep)
+#
+# Key SwinIR improvements over a plain Swin stack:
+#   • Learnable relative position bias (RPB) in every attention layer
+#   • RSTB residual stabilises gradient flow across many STL layers
+#   • Long skip from shallow conv bypasses all RSTBs (low-freq preservation)
 
 
-class WindowAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+class WindowAttentionRPB(nn.Module):
+    """Window multi-head self-attention with learnable relative position bias."""
+
+    def __init__(self, dim: int, window_size: int, num_heads: int):
         super().__init__()
         self.dim = dim
+        self.window_size = window_size
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3)
+        self.scale = (dim // num_heads) ** -0.5
+
+        # Learnable RPB table  shape: (2W-1)^2 × nH
+        self.rpb_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) ** 2, num_heads)
+        )
+        nn.init.trunc_normal_(self.rpb_table, std=0.02)
+
+        # Pre-computed relative position index  shape: W^2 × W^2
+        hs = torch.arange(window_size)
+        ws = torch.arange(window_size)
+        coords = torch.stack(torch.meshgrid(hs, ws, indexing="ij"))  # 2,W,W
+        flat = torch.flatten(coords, 1)  # 2, W^2
+        rel = flat[:, :, None] - flat[:, None, :]  # 2, W^2, W^2
+        rel = rel.permute(1, 2, 0).contiguous()
+        rel[:, :, 0] += window_size - 1
+        rel[:, :, 1] += window_size - 1
+        rel[:, :, 0] *= 2 * window_size - 1
+        self.register_buffer("rpb_index", rel.sum(-1))  # W^2, W^2
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x, attn_mask=None):
-        b, n, c = x.shape
-        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if attn_mask is not None:
-            nw = attn_mask.shape[0]
-            attn = attn.view(b // nw, nw, self.num_heads, n, n)
-            attn = attn + attn_mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, n, n)
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        B_, N, C = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv.unbind(0)
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+
+        # Add relative position bias
+        rpb = self.rpb_table[self.rpb_index.view(-1)]
+        rpb = rpb.view(N, N, self.num_heads).permute(2, 0, 1).contiguous()
+        attn = attn + rpb.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
         attn = torch.softmax(attn, dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         return self.proj(x)
 
 
-class SwinBlock(nn.Module):
-    def __init__(self, dim, num_heads, window_size, shift_size):
+class SwinTransformerLayer(nn.Module):
+    """Swin Transformer Layer (STL): W-MSA or SW-MSA + MLP, both with residuals."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: int,
+        shift_size: int,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
         self.window_size = window_size
         self.shift_size = shift_size
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowAttention(dim=dim, num_heads=num_heads)
+        self.attn = WindowAttentionRPB(dim, window_size, num_heads)
         self.norm2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim)
+            nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim)
         )
 
-    def _partition(self, x, ws):
-        b, h, w, c = x.shape
-        x = x.view(b, h // ws, ws, w // ws, ws, c)
-        return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, ws * ws, c)
+    # ── static window helpers ─────────────────────────────────────────────────
 
-    def _reverse(self, windows, ws, h, w, b):
-        x = windows.view(b, h // ws, w // ws, ws, ws, -1)
-        return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, -1)
+    @staticmethod
+    def _partition(x: torch.Tensor, ws: int) -> torch.Tensor:
+        B, H, W, C = x.shape
+        x = x.view(B, H // ws, ws, W // ws, ws, C)
+        return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, ws * ws, C)
 
-    def _mask(self, h, w, device):
+    @staticmethod
+    def _reverse(wins: torch.Tensor, ws: int, H: int, W: int) -> torch.Tensor:
+        B = int(wins.shape[0] * ws * ws / (H * W))
+        x = wins.view(B, H // ws, W // ws, ws, ws, -1)
+        return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+
+    def _mask(self, H: int, W: int, device) -> torch.Tensor:
         if self.shift_size == 0:
             return None
-        img_mask = torch.zeros((1, h, w, 1), device=device)
-        hs = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        ws = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
+        img = torch.zeros(1, H, W, 1, device=device)
         cnt = 0
-        for hs_ in hs:
-            for ws_ in ws:
-                img_mask[:, hs_, ws_, :] = cnt
+        for hs in (
+            slice(0, -self.window_size),
+            slice(-self.window_size, -self.shift_size),
+            slice(-self.shift_size, None),
+        ):
+            for ws in (
+                slice(0, -self.window_size),
+                slice(-self.window_size, -self.shift_size),
+                slice(-self.shift_size, None),
+            ):
+                img[:, hs, ws, :] = cnt
                 cnt += 1
-        mw = self._partition(img_mask, self.window_size).squeeze(-1)
-        am = mw.unsqueeze(1) - mw.unsqueeze(2)
+        m = self._partition(img, self.window_size).squeeze(-1)
+        am = m.unsqueeze(1) - m.unsqueeze(2)
         return am.masked_fill(am != 0, -100.0).masked_fill(am == 0, 0.0)
 
-    def forward(self, x):
-        b, h, w, c = x.shape
+    # ── forward ───────────────────────────────────────────────────────────────
+
+    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """x: [B, H*W, C]"""
+        B, _, C = x.shape
         sc = x
-        x = self.norm1(x)
+        x = self.norm1(x).view(B, H, W, C)
+
         if self.shift_size > 0:
-            sx = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            sx = x
-        xw = self._partition(sx, self.window_size)
-        aw = self.attn(xw, self._mask(h, w, x.device))
-        sx = self._reverse(aw, self.window_size, h, w, b)
+            x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+
+        wins = self._partition(x, self.window_size)
+        wins = self.attn(wins, self._mask(H, W, wins.device))
+        x = self._reverse(wins, self.window_size, H, W)
+
         if self.shift_size > 0:
-            x = torch.roll(sx, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = sx
-        x = sc + x
+            x = torch.roll(x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+
+        x = sc + x.view(B, H * W, C)
         return x + self.mlp(self.norm2(x))
 
 
-class BasicSwinLayer(nn.Module):
-    def __init__(self, dim, depth, num_heads, window_size, use_checkpoint=True):
+class ResidualSwinTransformerBlock(nn.Module):
+    """RSTB: stl_per_rstb STLs → 3×3 Conv → residual (SwinIR Fig. 2a)."""
+
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        window_size: int,
+        use_checkpoint: bool = True,
+    ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.blocks = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [
-                SwinBlock(
+                SwinTransformerLayer(
                     dim=dim,
                     num_heads=num_heads,
                     window_size=window_size,
@@ -200,66 +269,78 @@ class BasicSwinLayer(nn.Module):
                 for i in range(depth)
             ]
         )
+        # Conv after STLs enhances translational equivariance (SwinIR )
+        self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
 
-    def forward(self, x):
-        for blk in self.blocks:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, C, H, W]"""
+        shortcut = x
+        B, C, H, W = x.shape
+        seq = x.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        for layer in self.layers:
             if self.use_checkpoint and self.training:
-                x = checkpoint(blk, x, use_reentrant=False)
+                seq = checkpoint(layer, seq, H, W, use_reentrant=False)
             else:
-                x = blk(x)
-        return x
+                seq = layer(seq, H, W)
+        feat = seq.transpose(1, 2).view(B, C, H, W)
+        return self.conv(feat) + shortcut  # RSTB residual
 
 
-class SwinScratchDenoiser(LIONmodel):
+class SwinIRCTDenoiser(LIONmodel):
+    """
+    SwinIR-style denoiser for CT reconstruction, trained via Noise2Inverse.
+
+    Compared with a plain Swin U-Net this model adds:
+      • Relative position bias  – content-adaptive long-range attention
+      • RSTB residuals          – gradient highway across many STL layers
+      • Long skip connection    – preserves low-frequency anatomy unchanged
+      • Residual output         – network learns the noise residual, not the image
+    """
+
     def __init__(self, geometry, model_parameters=None):
         if model_parameters is None:
-            model_parameters = SwinScratchDenoiser.default_parameters()
+            model_parameters = SwinIRCTDenoiser.default_parameters()
         super().__init__(model_parameters, geometry)
         p = self.model_parameters
         self.window_size = p.window_size
-        self.in_proj = nn.Conv2d(1, p.embed_dim, 3, padding=1)
-        self.stage1 = BasicSwinLayer(
-            p.embed_dim, p.depth_stage1, p.heads_stage1, p.window_size, p.use_checkpoint
+
+        # 1. Shallow feature extraction (single conv — stable early gradients)
+        self.shallow = nn.Conv2d(1, p.embed_dim, 3, 1, 1)
+
+        # 2. Deep feature extraction: num_rstb RSTBs + norm + conv
+        self.rstbs = nn.ModuleList(
+            [
+                ResidualSwinTransformerBlock(
+                    dim=p.embed_dim,
+                    depth=p.stl_per_rstb,
+                    num_heads=p.num_heads,
+                    window_size=p.window_size,
+                    use_checkpoint=p.use_checkpoint,
+                )
+                for _ in range(p.num_rstb)
+            ]
         )
-        self.down = nn.Conv2d(p.embed_dim, p.embed_dim * 2, 3, stride=2, padding=1)
-        self.stage2 = BasicSwinLayer(
-            p.embed_dim * 2,
-            p.depth_stage2,
-            p.heads_stage2,
-            p.window_size,
-            p.use_checkpoint,
-        )
-        self.up = nn.ConvTranspose2d(p.embed_dim * 2, p.embed_dim, 2, stride=2)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(p.embed_dim * 2, p.embed_dim, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(p.embed_dim, p.embed_dim, 3, padding=1),
-        )
-        self.stage3 = BasicSwinLayer(
-            p.embed_dim, p.depth_stage3, p.heads_stage3, p.window_size, p.use_checkpoint
-        )
-        self.out_head = nn.Sequential(
-            nn.Conv2d(p.embed_dim, p.embed_dim // 2, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(p.embed_dim // 2, 1, 3, padding=1),
-        )
+        self.norm = nn.LayerNorm(p.embed_dim)
+        self.deep_conv = nn.Conv2d(p.embed_dim, p.embed_dim, 3, 1, 1)
+
+        # 3. Reconstruction: fused shallow+deep → 1 channel
+        self.recon = nn.Conv2d(p.embed_dim, 1, 3, 1, 1)
 
     @staticmethod
     def default_parameters():
         p = LIONModelParameter()
         p.model_input_type = ModelInputType.IMAGE
-        p.embed_dim = 64
-        p.window_size = 7
-        p.depth_stage1 = 2
-        p.depth_stage2 = 2
-        p.depth_stage3 = 1
-        p.heads_stage1 = 4
-        p.heads_stage2 = 8
-        p.heads_stage3 = 4
+        # SwinIR lightweight settings (similar param count to N2I U-Net ~2-3 M)
+        p.embed_dim = 96  # feature channels
+        p.window_size = 8  # SwinIR uses 8 for denoising tasks
+        p.num_rstb = 4  # number of Residual Swin Transformer Blocks
+        p.stl_per_rstb = 4  # Swin Transformer Layers per RSTB
+        p.num_heads = 6
         p.use_checkpoint = True
         return p
 
-    def _pad(self, x, m):
+    def _pad(self, x: torch.Tensor):
+        m = self.window_size
         _, _, h, w = x.shape
         ph = (m - h % m) % m
         pw = (m - w % m) % m
@@ -267,33 +348,38 @@ class SwinScratchDenoiser(LIONmodel):
             return x, (0, 0)
         return F.pad(x, (0, pw, 0, ph), mode="reflect"), (ph, pw)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 4:
             raise ValueError(f"Expected [B,C,H,W], got {tuple(x.shape)}")
         if x.shape[1] != 1:
             x = x[:, :1]
-        orig_h, orig_w = x.shape[2], x.shape[3]
-        x, (ph, pw) = self._pad(x, self.window_size)
 
-        f = self.in_proj(x)
-        s1 = self.stage1(f.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        s2 = self.stage2(self.down(s1).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        u = self.up(s2)
-        if u.shape != s1.shape:
-            u = F.interpolate(
-                u, size=s1.shape[2:], mode="bilinear", align_corners=False
-            )
-        s3 = self.stage3(
-            self.fuse(torch.cat([u, s1], dim=1)).permute(0, 2, 3, 1)
-        ).permute(0, 3, 1, 2)
-        out = x + self.out_head(s3)
+        orig_h, orig_w = x.shape[2], x.shape[3]
+        x, (ph, pw) = self._pad(x)
+        _, _, H, W = x.shape
+
+        # 1. Shallow features (long skip — low-freq preservation)
+        f_shallow = self.shallow(x)
+
+        # 2. Deep features through RSTBs
+        f = f_shallow
+        for rstb in self.rstbs:
+            f = rstb(f)
+
+        # Final LayerNorm in sequence domain then project back to spatial
+        B, C, _, _ = f.shape
+        f = self.norm(f.flatten(2).transpose(1, 2)).transpose(1, 2).view(B, C, H, W)
+        f = self.deep_conv(f)
+
+        # 3. Residual reconstruction: input + recon(shallow + deep)
+        out = x + self.recon(f_shallow + f)
 
         if ph > 0 or pw > 0:
             out = out[:, :, :orig_h, :orig_w]
         return out
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 
 def set_seed(seed):
@@ -383,7 +469,7 @@ def train(
     experiment, train_loader, val_loader, device, output_dir, tag, epochs, sino_splits
 ):
     """Train with Enhanced Model Selection (based on validation PSNR)."""
-    model = SwinScratchDenoiser(experiment.geometry)
+    model = SwinIRCTDenoiser(experiment.geometry)
     optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
@@ -403,7 +489,7 @@ def train(
     )
     solver.set_training(train_loader)
     solver.set_checkpointing(
-        checkpoint_fname=f"{tag}_custom_swin_n2i_check_*.pt",
+        checkpoint_fname=f"{tag}_swinir_n2i_check_*.pt",
         checkpoint_freq=1,  # Save every epoch for model selection
         load_checkpoint_if_exists=False,
         save_folder=output_dir,
@@ -607,7 +693,7 @@ def run(args):
     torch.save(results, pt_path)
 
     print("\n" + "=" * 70)
-    print("SWIN (SCRATCH) + N2I — CUSTOM GEOMETRY RESULTS")
+    print("SWINIR + N2I — CUSTOM GEOMETRY RESULTS")
     print("=" * 70)
     for row in results:
         img = to_np(row["reconstruction"]).squeeze()
@@ -637,6 +723,6 @@ if __name__ == "__main__":
     parser.add_argument("--train-samples", type=int, default=64)
     parser.add_argument("--val-samples", type=int, default=10)
     parser.add_argument("--test-index", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--sino-splits", type=int, default=5)
     run(parser.parse_args())
