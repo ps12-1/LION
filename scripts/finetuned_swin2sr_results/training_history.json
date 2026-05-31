@@ -1,0 +1,20 @@
+{
+  "train_losses": [
+    1.4455437344906841e-08
+  ],
+  "val_losses": [
+    1.0469305244953376e-08
+  ],
+  "val_psnr": [
+    -19.087289810180664
+  ],
+  "val_ssim": [
+    -9.956768190022558e-05
+  ],
+  "best_val_loss": 1.0469305244953376e-08,
+  "epochs": 1,
+  "batch_size": 1,
+  "learning_rate": 1e-05,
+  "model_name": "caidas/swin2SR-classical-sr-x2-64",
+  "dataset": "LIDC-IDRI"
+}

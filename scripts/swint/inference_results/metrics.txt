@@ -1,0 +1,14 @@
+FDK vs Hugging Face Enhanced Reconstruction Metrics
+============================================================
+
+FDK Reconstruction:
+  SSIM: 0.121433
+  PSNR: 15.02 dB
+
+HF Enhanced Reconstruction:
+  SSIM: 0.058299
+  PSNR: 11.01 dB
+
+Improvements:
+  SSIM improvement: -0.063134
+  PSNR improvement: -4.01 dB

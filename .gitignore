@@ -3,6 +3,7 @@
 *.egg
 *.pdf
 *.pt
+*.npy
 
 
 nohup.out
@@ -34,3 +35,21 @@ wandb
 !scripts/angleexp/results_custom_geometry/*.png
 !scripts/angleexp/results_comparison/
 !scripts/angleexp/results_comparison/*.png
+
+!inference_results/
+!inference_results/*.png
+!scripts/finetuned_swin2sr_results/
+!scripts/finetuned_swin2sr_results/*.png
+!scripts/finetuned_swin2sr_results/*.json
+!scripts/swint/inference_results/
+!scripts/swint/inference_results/*.png
+!scripts/swint/inference_results/*.txt
+!scripts/angleexp/scripts/
+!scripts/angleexp/scripts/angleexp/
+!scripts/angleexp/scripts/angleexp/results/
+!scripts/angleexp/scripts/angleexp/results/*.png
+!scripts/angleexp/scripts/angleexp/results/*.json
+!scripts/angleexp/scripts/angleexp/results_comparison/
+!scripts/angleexp/scripts/angleexp/results_comparison/*.png
+!scripts/angleexp/scripts/angleexp/results_swin/
+!scripts/angleexp/scripts/angleexp/results_swin/*.png
