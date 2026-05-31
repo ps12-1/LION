@@ -1,6 +1,8 @@
 *.png
 *.pyc
 *.egg
+*.pdf
+*.pt
 
 
 nohup.out
@@ -8,6 +10,14 @@ nohup.out
 *~
 build/*
 .vscode
+scripts/angleexp/hf_cache/
+scripts/angleexp/results_all_models/
+scripts/angleexp/results_custom_geometry/
+scripts/angleexp/results_comparison/
+scripts/angleexp/scripts/
+scripts/finetuned_swin2sr_results/
+scripts/swint/inference_results/
+inference_results/
 
 LION.egg-info
 dist
@@ -16,3 +26,11 @@ example.py
 /slurm
 
 wandb
+
+# Allow selected result images
+!scripts/angleexp/results_all_models/
+!scripts/angleexp/results_all_models/*.png
+!scripts/angleexp/results_custom_geometry/
+!scripts/angleexp/results_custom_geometry/*.png
+!scripts/angleexp/results_comparison/
+!scripts/angleexp/results_comparison/*.png
